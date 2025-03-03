@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 from dotenv import load_dotenv
 from langchain_text_splitters import NLTKTextSplitter
@@ -6,6 +7,8 @@ import pygame
 import sys
 import pysqlite3
 import sys
+
+from JayceResponse import JayceResponse
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -13,14 +16,23 @@ from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-from npc1_message import NPC1Message
-# Ajusta el tamaño de cada tile (en píxeles)
 TILE_SIZE = 48
 TEXT_COLOR = (255, 255, 255)
 
+BOOK_FILES = [
+    {
+        'file': 'susurro_del_bosque.txt',
+        'name': 'El Susurro del Bosque'
+    },
+    {
+        'file': 'el_ultimo_archivo.txt',
+        'name': 'El Último Archivo'
+    }
+]
+
 load_dotenv()
 
-SYSTEM_TEMPLATE_NPC = """Eres un NPC llamado NPC1en un juego que está tratando de recordar un libro. Estás un poco confundido y frustrado porque 
+SYSTEM_TEMPLATE_NPC1 = """Eres un NPC llamado Jayce que está tratando de recordar un libro. Estás un poco confundido y frustrado porque 
     no puedes recordar el título, pero recuerdas fragmentos del contenido. Tu personalidad es amigable pero algo distraída.
 
     Comportamiento:
@@ -30,7 +42,8 @@ SYSTEM_TEMPLATE_NPC = """Eres un NPC llamado NPC1en un juego que está tratando 
     4. Mantén respuestas cortas y conversacionales, como si estuvieras hablando en persona.
     5. Si el jugador no ha dicho nada en el último mensaje, debes empezar o continuar la conversación.
     6. Nunca digas el nombre del libro, en caso de que te viniera el nombre del libro como fragmento, no compartas el fragmento.
-    7. Si el jugador te dice el nombre del libro (tiene que ser el nombre exacto del libro), debes felicitarte y decir que ya lo recuerdas.
+    7. Si el jugador te dice el nombre del libro (tiene que ser el nombre exacto del libro), debes felicitarle y actualizar la variable book_remembered a True.
+    8. Cuando el jugador ya te ha dicho el nombre del libro, recuérdale que ha aparecido una especie de portal en la esquina superior derecha del mapa.
 
     Basándote en esta conversación:
     <conversation>
@@ -47,8 +60,56 @@ SYSTEM_TEMPLATE_NPC = """Eres un NPC llamado NPC1en un juego que está tratando 
     {fragment}
     </fragment>
 
-    Genera una respuesta apropiada acorde.
+    Genera un JSON con la siguiente estructura:
+    {{
+        "response": "string",
+        "book_remembered": bool
+    }}
     """
+
+SYSTEM_TEMPLATE_NPC2 = """Eres un NPC llamado Ekko que debe ayudar al jugador a deducir el nombre de un libro a partir de fragmentos proporcionados y el historial de la conversación.
+
+Comportamiento:
+1. A cada mensaje recibirás el historial de la conversación con el jugador.
+2. Utiliza la conversación para intentar adivinar el nombre del libro.
+3. Mantén una personalidad amigable, cooperativa y algo curiosa.
+4. Si estás seguro del nombre del libro, comunícalo al jugador.
+5. Si no estás seguro, pide más información o fragmentos.
+6. Si el jugador no ha dicho nada en el último mensaje, debes empezar o continuar la conversación.
+7. Ciñete a los libros proporcionados, no uses otros libros.
+
+Basándote en esta conversación:
+<conversation>
+{conversation}
+</conversation>
+
+Genera una respuesta apropiada.
+"""
+
+SYSTEM_TEMPLATE_NPC2_FULL = """Eres un NPC llamado Ekko que sabe deducir el nombre de un libro a partir de fragmentos proporcionados y el historial de la conversación.
+
+Comportamiento:
+1. A cada mensaje recibirás el historial de la conversación con el jugador y varios fragmentos del libro juntos con el nombre del libro.
+2. Utiliza los fragmentos y la conversación para intentar adivinar el nombre del libro.
+3. Mantén una personalidad amigable, cooperativa y algo curiosa.
+4. Si estás seguro del nombre del libro, comunícalo al jugador.
+5. Si no estás seguro, pide más información o fragmentos.
+6. Responde en español.
+
+Basándote en esta conversación:
+<conversation>
+{conversation}
+</conversation>
+
+Y estos fragmentos del libro:
+<fragments>
+{fragments}
+</fragments>
+
+Genera una respuesta apropiada.
+"""
+
+BOOK_REMEMBERED = False
 
 def load_map(filename):
     with open(filename, 'r') as f:
@@ -66,6 +127,10 @@ def init_llm():
         temperature=0
     )
 
+def load_random_book():
+    book_file = random.choice(BOOK_FILES)
+    return book_file
+
 def init_vectorstore(embeddings):
     vectorstore = Chroma(
         embedding_function=embeddings,
@@ -73,13 +138,9 @@ def init_vectorstore(embeddings):
         persist_directory="chroma_db"
     )
 
-    book1_docs = load_text_as_documents('susurro_del_bosque.txt', 'El Susurro del Bosque')
-    #book2_docs = load_text_as_documents('book2.txt')
-    #book3_docs = load_text_as_documents('book3.txt')
-
-    vectorstore.add_documents(book1_docs)
-    #vectorstore.add_documents(book2_docs)
-    #vectorstore.add_documents(book3_docs)
+    for book in BOOK_FILES:
+        book_docs = load_text_as_documents(book['file'], book['name'])
+        vectorstore.add_documents(book_docs)
 
     return vectorstore
 
@@ -94,7 +155,7 @@ def load_text_as_documents(file_path, book_name):
 
     return docs
 
-async def get_random_fragment(vectorstore: Chroma, chat_llm: ChatOpenAI, book_name: str):
+async def get_random_fragment(vectorstore: Chroma, book_name: str):
     filter_dict = {"book": {"$eq": book_name}}
 
     document = vectorstore.get(
@@ -105,85 +166,139 @@ async def get_random_fragment(vectorstore: Chroma, chat_llm: ChatOpenAI, book_na
     paragraph = random.choice(document["documents"])
 
     sentences = paragraph.split("\n") # This is the first sentence
-    print(f"Sentencias: {sentences}")
+    # Remove empty strings
+    sentences = [s for s in sentences if s.strip()]
+    #print(f"Sentencias: {sentences}")
 
     random_fragment = random.choice(sentences)
-    print(f"Fragmento aleatorio: {random_fragment}")
     return random_fragment
 
-    '''files_retriever = vectorstore.as_retriever(
-        search_kwargs={"k": 3, "filter": filter_dict}
-    )
-    chain_an = RetrievalQA.from_chain_type(llm=chat_llm, chain_type="stuff", retriever=files_retriever)
+async def get_summary(conversation, llm: ChatOpenAI):
+    """
+    Genera un resumen de la conversación utilizando el LLM.
+    """
+    summary_prompt = f"Resume la siguiente conversación:\n{conversation}"
+    response = await llm.ainvoke([summary_prompt])
+    return response.content.strip()
 
-    fragment = await chain_an.ainvoke({"query": f"Dame un fragmento aleatorio del libro {book_name}"})
-    print(fragment)
-    return fragment['result']'''
+async def get_npc2_response_v2(messages, vectorstore: Chroma, llm: ChatOpenAI):
+    """
+    Genera una respuesta asíncrona de NPC2 para deducir el nombre del libro basado en la conversación.
+    """
+    # Extraer el historial de la conversación (últimos 5 mensajes)
+    conversation = "\n".join(messages[-5:])
 
-    '''docs = files_retriever.invoke({"query": f"Dame un fragmento aleatorio del libro {book_name}"})
-    random_doc = random.choice(docs)
-    print(random_doc)
-    return random_doc.page_content'''
+    # Fase 1: Generar un resumen de la conversación
+    summary = await get_summary(conversation, llm)
 
-    '''retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    query = f"Dame un fragmento aleatorio del libro {book_name}"
-    result = ask_llm(llm, vectorstore, query)
-    return result['result']'''
+    # Configurar el retriever
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
+    # Fase 2: Recuperar documentos relevantes usando el resumen
+    retrieved_docs = retriever.invoke(summary)
 
-async def get_npc2_response(messages, vectorstore, llm: ChatOpenAI):
+    # Fase 3: Formatear los fragmentos para el prompt
+    fragments_info = "\n".join([f"{doc.metadata.get('name', 'Título desconocido')}: {doc.page_content}" for doc in retrieved_docs])
+
+    # Formatear el prompt con el resumen y los fragmentos
+    system_message = SYSTEM_TEMPLATE_NPC2.format(conversation=summary, fragments=fragments_info)
+
+    # Obtener la respuesta usando el LLM
+
+    try:
+        # Invocar al LLM de forma asíncrona
+        response = await llm.ainvoke([system_message])
+
+        # Procesar la respuesta
+        messages.append(f"Ekko: {response.content}")
+
+    except Exception as e:
+        print(f"Error en get_npc2_response: {e}")
+        messages.append("Ekko: Mmm... ¿qué me decías? Estaba pensando en el libro...")
+
+    # Procesar la respuesta
+
+async def get_npc2_response(messages, vectorstore: Chroma, llm: ChatOpenAI):
+    # Extraer el historial de la conversación (últimos 5 mensajes)
+    conversation = ""
+    if messages:
+        conversation = "\n".join([msg for msg in messages[-5:]])
+
+    if conversation:
+        # Configurar el retriever
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+        # Crear la cadena de RetrievalQA
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",  # Puedes ajustar el tipo de cadena según tus necesidades
+            retriever=retriever
+        )
+
+        # Formatear el prompt con la conversación
+        system_message = SYSTEM_TEMPLATE_NPC2.format(conversation=conversation)
+
+        try:
+            # Invocar al LLM de forma asíncrona
+            response = await qa_chain.ainvoke({"query": system_message})
+
+            # Procesar la respuesta
+            messages.append(f"Ekko: {response['result']}")
+
+        except Exception as e:
+            print(f"Error en get_npc2_response: {e}")
+            messages.append("Ekko: Mmm... ¿qué me decías? Estaba pensando en el libro...")
+
+    # If no conversation, then no relevant documents can be retrieved
+    # Invoke LLM without RetrievalQA
+    else:
+        
+        try:
+            system_message = SYSTEM_TEMPLATE_NPC2_FULL.format(conversation=conversation, fragments="")
+            response = await llm.ainvoke([system_message])
+            messages.append(f"Ekko: {response.content}")
+        except Exception as e:
+            print(f"Error en get_npc2_response: {e}")
+            messages.append("Ekko: Mmm... ¿qué me decías? Estaba pensando en el libro...")
+
+async def get_npc1_response(messages, vectorstore, llm: ChatOpenAI, book_name: str):
+
+    global BOOK_REMEMBERED
+
+    if BOOK_REMEMBERED:
+        messages.append(f"Jayce: ¡Ya lo recuerdo! El título del libro es {book_name}.")
+        return
     
-    book_name = "El Susurro del Bosque"
-
     # Convertimos los mensajes a un formato más legible 
     # If no messages, return empty string
     conversation = ""
     if messages:
         conversation = "\n".join([msg for msg in messages[-5:]])  # Últimos 5 mensajes
 
-    #llm_npc1 = llm.with_structured_output(NPC1Message)
+    fragment = await get_random_fragment(vectorstore, book_name)
 
-    fragment = await get_random_fragment(vectorstore, llm, book_name)
+    print(f"Fragmento aleatorio: {fragment}")
 
-    system_message = SYSTEM_TEMPLATE_NPC.format(conversation=conversation, fragment=fragment, book_name=book_name)
+    llm_structured = llm.with_structured_output(JayceResponse)
 
-    response = await llm.ainvoke([system_message])
+    #print(f"Conversation: {conversation}")
+    #print(f"Fragmento: {fragment}")
+    #print(f"Book name: {book_name}")
 
-    print(response)
+    system_message = SYSTEM_TEMPLATE_NPC1.format(conversation=conversation, fragment=fragment, book_name=book_name)
+
+    #print(f"System message: {system_message}")
         
     try:
-        messages.append(f"NPC1: {response.content}")
+        response: JayceResponse = await llm_structured.ainvoke([system_message])
+        print(f"Response: {response}")
+        messages.append(f"Jayce: {response.response}")
+        if response.book_remembered:
+            BOOK_REMEMBERED = True
     except Exception as e:
         print(f"Error: {e}")
         # Si algo falla, damos una respuesta segura
-        messages.append("NPC1: Mmm... ¿qué me decías? Estaba pensando en el libro...")
-
-async def get_npc1_response(messages, vectorstore, llm: ChatOpenAI):
-    
-    book_name = "El Susurro del Bosque"
-
-    # Convertimos los mensajes a un formato más legible 
-    # If no messages, return empty string
-    conversation = ""
-    if messages:
-        conversation = "\n".join([msg for msg in messages[-5:]])  # Últimos 5 mensajes
-
-    #llm_npc1 = llm.with_structured_output(NPC1Message)
-
-    fragment = await get_random_fragment(vectorstore, llm, book_name)
-
-    system_message = SYSTEM_TEMPLATE_NPC.format(conversation=conversation, fragment=fragment, book_name=book_name)
-
-    response = await llm.ainvoke([system_message])
-
-    print(response)
-        
-    try:
-        messages.append(f"NPC1: {response.content}")
-    except Exception as e:
-        print(f"Error: {e}")
-        # Si algo falla, damos una respuesta segura
-        messages.append("NPC1: Mmm... ¿qué me decías? Estaba pensando en el libro...")
+        messages.append("Jayce: Mmm... ¿qué me decías? Estaba pensando en el libro...")
 
 def load_tileset(path, tile_width, tile_height):
     sheet = pygame.image.load(path).convert_alpha()
@@ -208,7 +323,7 @@ def load_tileset(path, tile_width, tile_height):
 
     return tiles
 
-def check_collision(level_data, x, y, tile_size):
+def check_collision(level_data, x, y, tile_size, object_type):
     """
     Verifica colisiones en las cuatro esquinas del sprite del jugador
     Retorna True si hay colisión con una pared
@@ -234,128 +349,11 @@ def check_collision(level_data, x, y, tile_size):
         # Verificamos que las coordenadas estén dentro de los límites del mapa
         if (0 <= tile_x < len(level_data[0]) and 
             0 <= tile_y < len(level_data) and 
-            level_data[tile_y][tile_x] == '#'):
+            level_data[tile_y][tile_x] == object_type):
             return True
     
     return False
 
-def check_npc1_collision(player_x, player_y, level_data, tile_size):
-    """
-    Verifica colisiones con NPC1 y retorna (bool, tuple) donde
-    bool indica si hay colisión y tuple es la posición del NPC1
-    """
-    margin = 6
-    check_x = player_x + margin
-    check_y = player_y + margin
-    check_size = tile_size - (margin * 2)
-    
-    points_to_check = [
-        (check_x, check_y),
-        (check_x + check_size, check_y),
-        (check_x, check_y + check_size),
-        (check_x + check_size, check_y + check_size)
-    ]
-    
-    for point_x, point_y in points_to_check:
-        tile_x = point_x // tile_size
-        tile_y = point_y // tile_size
-        
-        if (0 <= tile_x < len(level_data[0]) and 
-            0 <= tile_y < len(level_data) and 
-            level_data[tile_y][tile_x] == '1'):
-            return True, (tile_x * tile_size, tile_y * tile_size)
-    return False, None
-
-def check_enemy_collision(player_x, player_y, level_data, tile_size):
-    """
-    Verifica colisiones con enemigos y retorna (bool, tuple) donde
-    bool indica si hay colisión y tuple es la posición del enemigo
-    """
-    margin = 6
-    check_x = player_x + margin
-    check_y = player_y + margin
-    check_size = tile_size - (margin * 2)
-    
-    points_to_check = [
-        (check_x, check_y),
-        (check_x + check_size, check_y),
-        (check_x, check_y + check_size),
-        (check_x + check_size, check_y + check_size)
-    ]
-    
-    for point_x, point_y in points_to_check:
-        tile_x = point_x // tile_size
-        tile_y = point_y // tile_size
-        
-        if (0 <= tile_x < len(level_data[0]) and 
-            0 <= tile_y < len(level_data) and 
-            level_data[tile_y][tile_x] == 'E'):
-            return True, (tile_x * tile_size, tile_y * tile_size)
-    return False, None
-
-def ask_llm(llm, vectorstore, question):
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-
-    # Creamos un modelo conversacional
-    llm = ChatOpenAI(
-        model_name="gpt-4o",
-        temperature=0
-    )
-
-    # Configuramos la cadena "RetrievalQA"
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",           # "stuff", "map_reduce", etc.
-        retriever=retriever,
-        return_source_documents=True  # si quieres ver los docs que halló
-    )
-
-    return qa_chain.invoke({"query": question})
-
-def get_npc_response(messages, vectorstore, llm):
-    """
-    Genera una respuesta inteligente del NPC basada en el historial de mensajes
-    """
-    system_prompt = """Eres un NPC en un juego que está tratando de recordar un libro. Estás un poco confundido y frustrado porque 
-    no puedes recordar el título, pero recuerdas fragmentos del contenido. Tu personalidad es amigable pero algo distraída.
-
-    Comportamiento:
-    1. Debes mantener el misterio sobre el título del libro mientras compartes fragmentos de su contenido.
-    2. Si el jugador menciona algo relacionado con el fragmento, muéstrate emocionado y anímalo a seguir ayudándote.
-    3. Decide si compartir un nuevo fragmento basándote en el contexto de la conversación.
-    4. Mantén respuestas cortas y conversacionales, como si estuvieras hablando en persona.
-
-    Formato de respuesta:
-    {
-        "share_fragment": true/false,  # Si debes compartir un nuevo fragmento
-        "response": "Tu respuesta conversacional aquí"
-    }
-    """
-
-    # Convertimos los mensajes a un formato más legible
-    conversation = "\n".join([msg for msg in messages[-5:]])  # Últimos 5 mensajes
-    
-    user_prompt = f"""Basándote en esta conversación:
-
-{conversation}
-
-Genera una respuesta apropiada. Si crees que es momento de compartir otro fragmento del libro, indica share_fragment=true.
-"""
-
-    # Obtenemos la respuesta del LLM
-    response = ask_llm(llm, vectorstore, user_prompt)
-    
-    try:
-        # Procesamos la respuesta (aquí podrías añadir más lógica para parsear el JSON)
-        if "share_fragment" in response and response["share_fragment"]:
-            # Obtenemos un nuevo fragmento
-            fragment = get_random_fragment(vectorstore, llm, "El Susurro del Bosque")
-            return f"{response['response']} ¡Oh! Y también recuerdo esta parte: '{fragment}'"
-        else:
-            return response['response']
-    except:
-        # Si algo falla, damos una respuesta segura
-        return "Mmm... ¿qué me decías? Estaba pensando en el libro..."
 
 def wrap_text(text, font, max_width):
     """
@@ -386,6 +384,9 @@ def wrap_text(text, font, max_width):
 async def main():
     pygame.init()
 
+    game_over = False
+    font_large = pygame.font.Font(None, 64)  # Fuente más grande para el mensaje final
+
     # Cargamos el nivel
     level_data = load_map('level.txt')
     rows = len(level_data)
@@ -403,22 +404,11 @@ async def main():
     floor = load_tileset('assets/Sand.png', 32, 32)
     wall = load_tileset('assets/Wall2.png', 32, 32)
     npcs = load_tileset('assets/Npcs4.png', 96, 96)
+    items = load_tileset('assets/Items.png', 32, 32)
 
     embeddings = init_embeddings()
     llm = init_llm()
     vectorstore = init_vectorstore(embeddings)
-
-    npc1_system_prompt = """Eres un NPC en un juego que está tratando de recordar un libro. Estás un poco confundido y frustrado porque 
-    no puedes recordar el título, pero recuerdas fragmentos del contenido. Tu personalidad es amigable pero algo distraída.
-
-    Comportamiento:
-    1. En la primera interacción, preséntate y explica que estás tratando de recordar un libro y que darás una recompensa si el jugador 
-    te ayuda a encontrar el título.
-    2. Cuando el jugador te hable, comparte fragmentos del libro que recuerdas (estos vendrán del contexto proporcionado).
-    3. Si el jugador menciona algo relacionado con el fragmento, muéstrate emocionado y anímalo a seguir ayudándote.
-    4. Mantén respuestas cortas y conversacionales, como si estuvieras hablando en persona.
-
-    Recuerda: Debes mantener el misterio sobre el título del libro mientras compartes fragmentos de su contenido."""
 
     # Variables del jugador
     player_pos = None
@@ -428,11 +418,15 @@ async def main():
     ANIMATION_SPEED = 100
     PLAYER_SPEED = 5
 
+    last_npc_interaction_time = 0
+    NPC_INTERACTION_COOLDOWN = 2000  # 2 segundos en milisegundos
+
     # Configuración de fuentes y chat
     font = pygame.font.Font(None, 32)
     chat_active = False
     chat_text = ""
-    messages = []
+    messages_npc1 = []
+    messages_npc2 = []
     TEXT_COLOR = (255, 255, 255)
     CHAT_HEIGHT = 200
     CHAT_MARGIN = 20
@@ -448,6 +442,8 @@ async def main():
     # Variables para el estado del diálogo
     npc_type = None
 
+    npc1_book = load_random_book()
+
     # Diccionario de animaciones del jugador
     player_animations = {
         'right': [player[2][0], player[2][1], player[2][2]],
@@ -462,7 +458,8 @@ async def main():
         '.': floor[0][0],
         'E': enemies[0][0],
         '1': npcs[0][1],
-        '2': npcs[4][1]
+        '2': npcs[4][1],
+        'W': items[0][12]
     }
 
     # Encontrar la posición inicial del jugador
@@ -477,16 +474,15 @@ async def main():
     
     while running:
         current_time = pygame.time.get_ticks()
-
-        # Detectar nuevos mensajes para autoscroll
-        if len(messages) > last_message_count:
-            scroll_offset = 0  # Reset al fondo
-            last_message_count = len(messages)
-        
+               
         # Manejo de eventos
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+
+            # Si el juego ha terminado, solo procesar el evento de salida
+            if game_over:
+                continue
 
             # Manejo de eventos del chat
             if chat_active:
@@ -533,10 +529,16 @@ async def main():
                     if event.key == pygame.K_RETURN:  # Enviar mensaje
                         if chat_text.strip():  # Si el mensaje no está vacío
                             # Añadimos el mensaje del jugador
-                            messages.append(f"Jugador: {chat_text}")
                             if npc_type == '1':  # Si estamos hablando con NPC1
+                                messages_npc1.append(f"Jugador: {chat_text}")
                                 # Creamos la tarea asíncrona y esperamos su resultado
-                                task = asyncio.create_task(get_npc1_response(messages, vectorstore, llm))
+                                task = asyncio.create_task(get_npc1_response(messages_npc1, vectorstore, llm, npc1_book['name']))
+                                # Cuando la tarea termine, activamos el autoscroll
+                                task.add_done_callback(lambda _: setattr(sys.modules[__name__], 'should_autoscroll', True))
+                            elif npc_type == '2':  # Si estamos hablando con NPC2
+                                messages_npc2.append(f"Jugador: {chat_text}")
+                                # Creamos la tarea asíncrona y esperamos su resultado
+                                task = asyncio.create_task(get_npc2_response(messages_npc2, vectorstore, llm))
                                 # Cuando la tarea termine, activamos el autoscroll
                                 task.add_done_callback(lambda _: setattr(sys.modules[__name__], 'should_autoscroll', True))
                             chat_text = ""
@@ -544,19 +546,36 @@ async def main():
                     elif event.key == pygame.K_ESCAPE:  # Cerrar chat
                         chat_active = False
                         chat_text = ""
-                        messages = []
                         npc_type = None
+                        last_npc_interaction_time = pygame.time.get_ticks()  # Actualizar el tiempo al cerrar el chat
                         continue
                     elif event.key == pygame.K_BACKSPACE:  # Borrar
                         chat_text = chat_text[:-1]
                     else:
                         # Añadir caracteres al mensaje (limitado a 50 caracteres)
-                        if event.unicode.isprintable() and len(chat_text) < 50:
+                        if event.unicode.isprintable() and len(chat_text) < 200:
                             chat_text += event.unicode
 
         # Dar tiempo al bucle de eventos para procesar tareas asíncronas
         await asyncio.sleep(0)
 
+        # Si el juego ha terminado, mostrar la pantalla de fin
+        if game_over:
+            # Fondo negro semi-transparente
+            overlay = pygame.Surface((screen_width, screen_height))
+            overlay.fill((0, 0, 0))
+            overlay.set_alpha(180)
+            screen.blit(overlay, (0, 0))
+            
+            # Texto de victoria
+            victory_text = "¡Enhorabuena, has ayudado a Jayce a recordar el libro!"
+            text_surface = font_large.render(victory_text, True, (255, 255, 255))
+            text_rect = text_surface.get_rect(center=(screen_width/2, screen_height/2))
+            screen.blit(text_surface, text_rect)
+            
+            pygame.display.flip()
+            continue
+        
         # Solo procesamos movimiento si no estamos en chat
         if not chat_active:
             # Manejo del movimiento
@@ -585,24 +604,27 @@ async def main():
             new_pos[0] = max(0, min(new_pos[0], screen_width - TILE_SIZE))
             new_pos[1] = max(0, min(new_pos[1], screen_height - TILE_SIZE))
 
-            if not check_collision(level_data, new_pos[0], new_pos[1], TILE_SIZE):
+            if not check_collision(level_data, new_pos[0], new_pos[1], TILE_SIZE, '#'):
                 player_pos = new_pos
-                # Verificar colisión con enemigo después de mover
-                player_pos = new_pos
-                # Verificar colisión con enemigo después de mover
-                has_collision, enemy_pos = check_npc1_collision(player_pos[0], player_pos[1], level_data, TILE_SIZE)
-                if has_collision:
-                    # Creamos un ID único para esta colisión
-                    current_collision_id = (tuple(player_pos), enemy_pos)
-                    # Solo abrimos el chat si es una colisión diferente
-                    if current_collision_id != last_collision_id:
+
+                # Check collision with the item
+                if check_collision(level_data, player_pos[0], player_pos[1], TILE_SIZE, 'W'):
+                    game_over = True
+
+                # Verificar colisión con NPCs solo si ha pasado suficiente tiempo
+                elif current_time - last_npc_interaction_time >= NPC_INTERACTION_COOLDOWN:
+                    npc1_collision = check_collision(level_data, player_pos[0], player_pos[1], TILE_SIZE, '1')
+                    npc2_collision = check_collision(level_data, player_pos[0], player_pos[1], TILE_SIZE, '2')
+                    if npc1_collision:
                         chat_active = True
                         npc_type = '1'  # Marcamos que estamos hablando con NPC1
-                        last_collision_id = current_collision_id
-                        asyncio.create_task(get_npc1_response(messages, vectorstore, llm))
-                else:
-                    # Reseteamos el ID de colisión cuando no hay colisión
-                    last_collision_id = None
+                        asyncio.create_task(get_npc1_response(messages_npc1, vectorstore, llm, npc1_book['name']))
+                    elif npc2_collision:
+                        chat_active = True
+                        npc_type = '2'  # Marcamos que estamos hablando con NPC2
+                        asyncio.create_task(get_npc2_response(messages_npc2, vectorstore, llm))
+
+                
 
             # Actualizar animación
             if moving:
@@ -624,9 +646,10 @@ async def main():
                 # Siempre dibujamos el suelo
                 screen.blit(floor[0][0], (x, y))
                 
-                # Dibujamos paredes y enemigos
+                # Dibujamos paredes y enemigos, pero no el cofre
                 if tile_char in tile_mapping:
-                    screen.blit(tile_mapping[tile_char], (x, y))
+                    if tile_char != 'W' or BOOK_REMEMBERED:
+                        screen.blit(tile_mapping[tile_char], (x, y))
 
         # Dibujamos al jugador
         current_frame = player_animations[player_direction][animation_frame]
@@ -642,9 +665,24 @@ async def main():
 
             # Calcular todas las líneas
             total_lines = []
-            for msg in messages:
-                wrapped_lines = wrap_text(msg, font, screen_width - CHAT_MARGIN * 3 - SCROLLBAR_WIDTH)
-                total_lines.extend(wrapped_lines)
+            if npc_type == '1':
+                # Detectar nuevos mensajes para autoscroll
+                if len(messages_npc1) > last_message_count:
+                    scroll_offset = 0  # Reset al fondo
+                    last_message_count = len(messages_npc1)
+
+                for msg in messages_npc1:
+                    wrapped_lines = wrap_text(msg, font, screen_width - CHAT_MARGIN * 3 - SCROLLBAR_WIDTH)
+                    total_lines.extend(wrapped_lines)
+            elif npc_type == '2':
+                # Detectar nuevos mensajes para autoscroll
+                if len(messages_npc2) > last_message_count:
+                    scroll_offset = 0  # Reset al fondo
+                    last_message_count = len(messages_npc2)
+
+                for msg in messages_npc2:
+                    wrapped_lines = wrap_text(msg, font, screen_width - CHAT_MARGIN * 3 - SCROLLBAR_WIDTH)
+                    total_lines.extend(wrapped_lines)
 
             # Autoscroll si está activado y hay suficientes líneas
             if should_autoscroll and len(total_lines) > MAX_VISIBLE_LINES:
